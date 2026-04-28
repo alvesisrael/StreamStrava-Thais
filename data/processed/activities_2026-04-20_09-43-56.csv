@@ -1,0 +1,2 @@
+﻿id;name;sport_type;start_date;distance_km;moving_time_sec;elapsed_time_sec;elevation_gain;average_heartrate;max_heartrate;average_cadence;average_speed;max_speed;pace_sec_km;pace_formatted;efficiency_index;calories;suffer_score;pr_count;achievement_count
+18181790145;Regenerando;Run;20/04/2026 06:11:51;10.01;3080;3080;24.1;147.2;156.0;86.3;3.249;3.66;308;5:07;2.0904;669.0;29.0;0;0

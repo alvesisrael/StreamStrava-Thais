@@ -1,0 +1,25 @@
+# ── Tokens OAuth — NUNCA subir ──────────────────────────────────────────────
+data/token.json
+data/namorada/token.json
+
+# ── Checkpoints de pipeline ──────────────────────────────────────────────────
+checkpoint.json
+data/namorada/checkpoint.json
+
+# ── Dados brutos (grandes, não necessários pro app) ──────────────────────────
+data/raw/
+data/namorada/raw/
+data/processed/snapshots/
+data/namorada/processed/snapshots/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

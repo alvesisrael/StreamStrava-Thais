@@ -82,66 +82,110 @@ def set_pace_yaxis(fig, pace_sec_series, step_sec=30):
 
 def zona_fc(hr):
     if pd.isna(hr): return "Sem FC"
-    if hr < 145:    return "Z1 - Regenerativo"
-    if hr < 160:    return "Z2 - Aeróbico"
+    if hr < 137:    return "Z1 - Regenerativo"
+    if hr < 165:    return "Z2 - Aeróbico"
     if hr < 175:    return "Z3 - Tempo"
     if hr < 185:    return "Z4 - Limiar"
     return "Z5 - VO2max"
 
-ZONAS_FACEIS = {"Z1 - Regenerativo", "Z2 - Aeróbico", "Sem FC"}
+# ── Palavras-chave para classificação por nome (1ª prioridade) ───────────────
+# Ordem importa: mais específico primeiro
+KEYWORDS_INTENSIDADE = {
+    "Muito Forte": ["intervalad","tiro","interval","vo2","muito forte",
+                    "repetição","repeticao","série","serie","prova","teste"],
+    "Forte":       ["fartlek","forte","threshold","limiar"],
+    "Moderado Firme": ["progressiv","ritmado","moderado firme","tempo run"],
+    "Moderado":    ["longo","moderado","moder","base","contínuo","continuo",
+                    "aeróbic","aerobic"],
+    "Leve":        ["regenerat","fácil","facil","easy","recovery",
+                    "leve","caminhad","walk","solto"],
+}
 
-def calc_intensidade_fc(laps_df):
+def _classify_by_name(name):
+    """Retorna intensidade baseada em palavras-chave no nome. None se não encontrar."""
+    if not name or pd.isna(name):
+        return None
+    n = str(name).lower()
+    for intensity, keywords in KEYWORDS_INTENSIDADE.items():
+        if any(kw in n for kw in keywords):
+            return intensity
+    return None
+
+def calc_intensidade_fc(laps_df, act_names=None):
     """
-    Classifica cada atividade pela distribuição real de tempo em zonas de FC.
+    Classificação em duas etapas:
+
+    1ª — Nome da atividade (palavras-chave): se o nome der uma pista clara,
+         usa ela diretamente. Resolve o caso de FC naturalmente alta em treinos fáceis.
+
+    2ª — Zonas de FC RELATIVAS ao FCmax do próprio atleta (fallback):
+         usa % da FC máxima registrada nos dados, adaptando-se a qualquer
+         nível de condicionamento sem depender de thresholds absolutos.
+
+         Zonas relativas:
+           Z1 < 65% FCmax  |  Z2 < 78%  |  Z3 < 85%  |  Z4 < 92%  |  Z5 ≥ 92%
 
     Remoção inteligente de aquecimento/desaquecimento:
-    - Remove o 1º lap APENAS se ele estiver em Z1/Z2/Sem FC (lap fácil = aquecimento)
-    - Remove o último lap APENAS se ele estiver em Z1/Z2/Sem FC (lap fácil = desaquecimento)
-    - Se o 1º lap já está em Z3/Z4/Z5, mantém (atleta começou forte desde o início)
-
-    Thresholds de classificação (baseados nos laps válidos):
-      Muito Forte  → Z5 ≥ 20% ou Z4+Z5 ≥ 50%
-      Forte        → Z4+Z5 ≥ 30%
-      Moderado Firme → Z4+Z5 ≥ 15% ou Z3 ≥ 25%
-      Leve         → Z1+Z2 ≥ 75%
-      Moderado     → demais casos
+    Remove 1º/último lap somente se estiver em zona fácil (Z1/Z2/Sem FC).
+    Se o atleta começar forte desde o 1º lap, ele é mantido.
     """
-    if laps_df.empty or "Zona FC" not in laps_df.columns:
+    if laps_df.empty or "average_heartrate" not in laps_df.columns:
         return pd.Series(dtype=str)
+
+    # FCmax do atleta baseado nos dados (mínimo de 150 para evitar outliers)
+    hr_max = laps_df["average_heartrate"].dropna().max()
+    hr_max = hr_max if (not pd.isna(hr_max) and hr_max > 150) else 195
+
+    # Zona relativa baseada em % do FCmax
+    def zona_rel(hr):
+        if pd.isna(hr): return "Sem FC"
+        p = hr / hr_max
+        if p < 0.65: return "Z1"
+        if p < 0.78: return "Z2"
+        if p < 0.85: return "Z3"
+        if p < 0.92: return "Z4"
+        return "Z5"
+
+    laps_df = laps_df.copy()
+    laps_df["Zona_Rel"] = laps_df["average_heartrate"].apply(zona_rel)
+    ZONAS_FACEIS_REL = {"Z1", "Z2", "Sem FC"}
 
     results = {}
 
     for aid, grp in laps_df.groupby("activity_id"):
+
+        # ── 1ª prioridade: nome da atividade ─────────────────────────────────
+        if act_names is not None and aid in act_names.index:
+            by_name = _classify_by_name(act_names.get(aid))
+            if by_name:
+                results[aid] = by_name
+                continue
+
+        # ── 2ª prioridade: zonas relativas de FC ─────────────────────────────
         grp = grp.sort_values("lap_index").copy()
 
-        # Remoção inteligente: só remove se o lap for "fácil"
+        # Remove aquecimento/desaquecimento (só se forem laps fáceis)
         if len(grp) > 3:
-            if grp.iloc[0]["Zona FC"] in ZONAS_FACEIS:
+            if grp.iloc[0]["Zona_Rel"] in ZONAS_FACEIS_REL:
                 grp = grp.iloc[1:]
-            if len(grp) > 1 and grp.iloc[-1]["Zona FC"] in ZONAS_FACEIS:
+            if len(grp) > 1 and grp.iloc[-1]["Zona_Rel"] in ZONAS_FACEIS_REL:
                 grp = grp.iloc[:-1]
 
         total = grp["moving_time_sec"].sum()
         if total == 0:
             continue
 
-        # Ignora atividades com >50% dos laps sem dados de FC
-        sem_fc = grp[grp["Zona FC"] == "Sem FC"]["moving_time_sec"].sum()
+        sem_fc = grp[grp["Zona_Rel"] == "Sem FC"]["moving_time_sec"].sum()
         if sem_fc / total > 0.5:
             continue
 
-        # % de tempo em cada zona
-        def pct(zona):
-            return grp[grp["Zona FC"] == zona]["moving_time_sec"].sum() / total
+        def pct(z):
+            return grp[grp["Zona_Rel"] == z]["moving_time_sec"].sum() / total
 
-        z1 = pct("Z1 - Regenerativo")
-        z2 = pct("Z2 - Aeróbico")
-        z3 = pct("Z3 - Tempo")
-        z4 = pct("Z4 - Limiar")
-        z5 = pct("Z5 - VO2max")
-
-        pct_z45 = z4 + z5
-        pct_z12 = z1 + z2
+        z1, z2, z3 = pct("Z1"), pct("Z2"), pct("Z3")
+        z4, z5     = pct("Z4"), pct("Z5")
+        pct_z45    = z4 + z5
+        pct_z12    = z1 + z2
 
         if z5 >= 0.20 or pct_z45 >= 0.50:
             intensity = "Muito Forte"
@@ -217,7 +261,9 @@ def load_all(base):
 
     # Calcula Intensidade_FC e junta nas atividades
     if not laps.empty and not act.empty:
-        intensidade_fc = calc_intensidade_fc(laps)
+        # Passa nomes das atividades para classificação por palavra-chave
+        act_names = act.set_index("id")["name"] if "name" in act.columns else None
+        intensidade_fc = calc_intensidade_fc(laps, act_names=act_names)
         if not intensidade_fc.empty:
             fc_df = intensidade_fc.reset_index()
             fc_df.columns = ["id", "Intensidade_FC"]
@@ -374,21 +420,29 @@ with tab_geral:
             with st.expander(f"Como cada categoria é definida? — {label}"):
                 if int_mode == "Automática (FC)":
                     st.markdown(
-                        "Cada atividade é classificada pelo **% de tempo que você ficou "
-                        "em cada zona de FC** nos laps intermediários "
-                        "(aquecimento e desaquecimento são excluídos automaticamente).\n"
+                        "A classificação usa **duas etapas em sequência**:\n\n"
+                        "**1ª — Nome da atividade:** se o nome contiver palavras-chave "
+                        "(ex: *regenerativo*, *intervalado*, *progressivo*), "
+                        "essa informação tem prioridade — resolve casos onde a FC "
+                        "naturalmente fica alta mesmo em treinos fáceis.\n\n"
+                        "**2ª — Zonas de FC relativas ao seu FCmax** (quando o nome "
+                        "não dá pista): usa % da sua FC máxima registrada nos dados, "
+                        "adaptando-se automaticamente a qualquer nível de condicionamento."
                     )
+                    st.markdown("**Critérios por zona relativa:**")
                     criterios = {
-                        "🟢 Leve":           "Z1+Z2 ≥ 75% do tempo",
-                        "🔵 Moderado":       "Demais casos (base aeróbica equilibrada)",
-                        "🟡 Moderado Firme": "Z4+Z5 ≥ 15% **ou** Z3 ≥ 25%",
+                        "🟢 Leve":           "Z1+Z2 ≥ 75%  *(< 78% FCmax)*",
+                        "🔵 Moderado":       "Demais casos",
+                        "🟡 Moderado Firme": "Z4+Z5 ≥ 15% **ou** Z3 ≥ 25%  *(78–92% FCmax)*",
                         "🟠 Forte":          "Z4+Z5 ≥ 30%",
-                        "🔴 Muito Forte":    "Z5 ≥ 20% **ou** Z4+Z5 ≥ 50%",
+                        "🔴 Muito Forte":    "Z5 ≥ 20% **ou** Z4+Z5 ≥ 50%  *(> 92% FCmax)*",
                     }
                     for cat, criterio in criterios.items():
                         st.markdown(f"**{cat}** → {criterio}")
                     st.caption(
-                        "Zonas de FC: Z1 < 137 bpm · Z2 < 165 · Z3 < 175 · Z4 < 185 · Z5 ≥ 185"
+                        "Palavras-chave reconhecidas: regenerativo, fácil, easy, longo, "
+                        "moderado, progressivo, ritmado, fartlek, forte, intervalado, "
+                        "tiro, prova, teste, entre outras."
                     )
                 else:
                     st.markdown(

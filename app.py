@@ -193,7 +193,12 @@ def load_all(base):
         rename_map = {c: "Intensidade" for c in act.columns if c.lower() == "intensidade"}
         act = act.rename(columns=rename_map)
         if "Intensidade" in act.columns:
-            act["Intensidade"] = act["Intensidade"].str.strip().str.title()
+            if act["Intensidade"].dropna().empty:
+                act = act.drop(columns=["Intensidade"])
+            else:
+                act["Intensidade"] = act["Intensidade"].astype(str).str.strip().str.title()
+                act["Intensidade"] = act["Intensidade"].replace("Nan", None)
+
 
     # Laps
     laps = read("activity_laps_consolidated.csv")

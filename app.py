@@ -193,12 +193,12 @@ def load_all(base):
         rename_map = {c: "Intensidade" for c in act.columns if c.lower() == "intensidade"}
         act = act.rename(columns=rename_map)
         if "Intensidade" in act.columns:
+            # Coluna pode ser float (tudo NaN) se o atleta não classificou manualmente
             if act["Intensidade"].dropna().empty:
-                act = act.drop(columns=["Intensidade"])
+                act = act.drop(columns=["Intensidade"])   # sem dados — descarta
             else:
                 act["Intensidade"] = act["Intensidade"].astype(str).str.strip().str.title()
                 act["Intensidade"] = act["Intensidade"].replace("Nan", None)
-
 
     # Laps
     laps = read("activity_laps_consolidated.csv")
@@ -236,8 +236,12 @@ max_d = df_raw["start_date"].max().date()
 date_range = st.sidebar.date_input("Período", value=(min_d, max_d),
                                     min_value=min_d, max_value=max_d)
 sports_all      = sorted(df_raw["sport_type"].dropna().unique())
+# Default só inclui modalidades que existem nos dados do atleta
+_default_sports = [s for s in ["Run","TrailRun"] if s in sports_all]
+if not _default_sports:                  # se nenhuma corrida, seleciona tudo
+    _default_sports = sports_all
 selected_sports = st.sidebar.multiselect("Modalidade", sports_all,
-                                          default=["Run","TrailRun"])
+                                          default=_default_sports)
 # Toggle: classificação automática (FC) ou manual
 has_fc_class = ("Intensidade_FC" in df_raw.columns
                 and df_raw["Intensidade_FC"].notna().any())

@@ -341,21 +341,24 @@ for _df in [df, df_run]:
     elif "Intensidade" not in _df.columns:
         _df["Intensidade"] = None
 
-# Helpers de best efforts
+# Helpers de best efforts — usam dados NÃO filtrados (records são all-time)
 def melhor_be(nome):
-    if be.empty: return "—"
-    s = be[be["name"].str.lower() == nome.lower()]
+    if be_raw.empty: return "—"
+    s = be_raw[be_raw["name"].str.lower() == nome.lower()]
     return fmt_pace(s["pace_sec_km"].min()) if not s.empty else "—"
 
 def melhor_3km():
-    if lps_run.empty: return "—"
+    # Usa laps não filtrados para garantir melhor all-time
+    lps_all = laps_raw[laps_raw["activity_sport_type"].isin(["Run","TrailRun"])].copy() \
+              if not laps_raw.empty else laps_raw
+    if lps_all.empty: return "—"
     best = None
-    for _, grp in lps_run.groupby("activity_id"):
+    for _, grp in lps_all.groupby("activity_id"):
         km = grp[(grp["distance_m"] >= 900) & (grp["distance_m"] <= 1100)]
         if len(km) >= 3:
             t = km.nsmallest(3,"lap_index")["moving_time_sec"].sum()
             if best is None or t < best: best = t
-    return fmt_pace(best / 3) if best else "—"   # pace médio dos 3km
+    return fmt_pace(best / 3) if best else "—"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ABAS

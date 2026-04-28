@@ -82,8 +82,8 @@ def set_pace_yaxis(fig, pace_sec_series, step_sec=30):
 
 def zona_fc(hr):
     if pd.isna(hr): return "Sem FC"
-    if hr < 137:    return "Z1 - Regenerativo"
-    if hr < 165:    return "Z2 - Aeróbico"
+    if hr < 145:    return "Z1 - Regenerativo"
+    if hr < 160:    return "Z2 - Aeróbico"
     if hr < 175:    return "Z3 - Tempo"
     if hr < 185:    return "Z4 - Limiar"
     return "Z5 - VO2max"

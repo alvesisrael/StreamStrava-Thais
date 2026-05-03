@@ -1587,11 +1587,11 @@ with tab_mapa:
 
     # ── Preparacao dos dados ────────────────────────────────────────────────
     df_map = df_run.copy()
-    if has_ll:
-        df_map = df_map[df_map["latitude"].notna() & df_map["longitude"].notna()]
     if poly_col:
         df_map = df_map[df_map[poly_col].notna() & (df_map[poly_col].astype(str).str.len() > 4)]
-    df_map = df_map.sort_values("start_date", ascending=False)
+    elif has_ll:
+        df_map = df_map[df_map["latitude"].notna() & df_map["longitude"].notna()]
+
 
     if df_map.empty:
         st.warning("Nenhuma atividade com dados de GPS no periodo selecionado.")
@@ -1624,8 +1624,16 @@ with tab_mapa:
         df_map   = df_map[df_map["id"].isin(_sel_ids)].copy()
         st.caption(f"**{len(df_map)}** atividade(s) selecionada(s) · {len(_all_labels)} disponíveis no período")
 
-        lat_c = float(df_map["latitude"].mean()) if has_ll else -23.55
-        lng_c = float(df_map["longitude"].mean()) if has_ll else -46.63
+        if poly_col and not df_map.empty:
+            _fc = decode_polyline(df_map[poly_col].dropna().iloc[0])
+            lat_c = _fc[0][0] if _fc else -23.55
+            lng_c = _fc[0][1] if _fc else -46.63
+        elif has_ll and df_map["latitude"].notna().any():
+            lat_c = float(df_map["latitude"].dropna().mean())
+            lng_c = float(df_map["longitude"].dropna().mean())
+        else:
+            lat_c, lng_c = -23.55, -46.63
+
 
         def get_color_hex(row):
             int_val = str(row.get("Intensidade","Moderado") or "Moderado")

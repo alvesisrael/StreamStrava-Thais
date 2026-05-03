@@ -22,7 +22,7 @@ except ImportError:
     HAS_FOLIUM = False
 
 st.set_page_config(page_title="PerformanceRun 🏃 — Thais", page_icon="🏃",
-                   layout="wide", initial_sidebar_state="collapsed")
+                   layout="wide", initial_sidebar_state="expanded")
 
 # ── Responsividade mobile ───────────────────────────────────────────────────
 st.markdown("""<style>

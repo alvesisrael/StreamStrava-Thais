@@ -8,16 +8,45 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import timedelta
 
+try:
+    import pydeck as pdk
+    HAS_PYDECK = True
+except ImportError:
+    HAS_PYDECK = False
+
+try:
+    from streamlit_folium import st_folium
+    import folium
+    HAS_FOLIUM = True
+except ImportError:
+    HAS_FOLIUM = False
+
 st.set_page_config(page_title="PerformanceRun 🏃 — Thais", page_icon="🏃",
-                   layout="wide", initial_sidebar_state="expanded")
+                   layout="wide", initial_sidebar_state="collapsed")
+
+# ── Responsividade mobile ───────────────────────────────────────────────────
+st.markdown("""<style>
+/* Mobile: reduz padding e permite scroll horizontal em gráficos */
+@media (max-width: 768px) {
+    .block-container { padding: .5rem .5rem 2rem !important; }
+    [data-testid="column"] { min-width: 0 !important; }
+    .stPlotlyChart > div { overflow-x: auto !important; }
+    h1 { font-size: 1.4rem !important; }
+    h2 { font-size: 1.2rem !important; }
+}
+/* Sidebar compacta em qualquer tela */
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+    padding-top: 1rem;
+}
+</style>""", unsafe_allow_html=True)
 
 INTENSITY_COLORS = {
-    "Leve":           "#2ECC71",
-    "Moderado":       "#3498DB",
-    "Moderado Firme": "#F39C12",
-    "Forte":          "#E67E22",
-    "Muito Forte":    "#E74C3C",
-    "Skate":          "#95A5A6",
+    "Leve":           "#27AE60",  # verde
+    "Moderado":       "#F1C40F",  # amarelo
+    "Moderado Firme": "#E67E22",  # laranja
+    "Forte":          "#E74C3C",  # vermelho
+    "Muito Forte":    "#922B21",  # vermelho escuro
+    "Skate":          "#95A5A6",  # cinza
 }
 INTENSITY_ORDER = ["Leve","Moderado","Moderado Firme","Forte","Muito Forte","Skate"]
 
@@ -56,14 +85,9 @@ def fmt_pace(sec):
     return f"{s // 60}:{s % 60:02d}"
 
 def set_pace_yaxis(fig, pace_sec_series, step_sec=30):
-    """Eixo Y de pace em mm:ss. Step adaptativo para evitar labels sobrepostos."""
     mn = max(0, int(pace_sec_series.min()) - step_sec)
     mx = int(pace_sec_series.max()) + step_sec
-    rng = mx - mn
-    # Adaptive step: evita dezenas de ticks quando há outliers (caminhadas etc.)
-    if rng > 480:    step_sec = 120
-    elif rng > 240:  step_sec = 60
-    vals = list(range(mn - mn % step_sec, mx + step_sec, step_sec))
+    vals  = list(range(mn - mn % step_sec, mx + step_sec, step_sec))
     fig.update_yaxes(
         autorange="reversed",
         tickvals=[v / 60 for v in vals],
@@ -207,6 +231,79 @@ def calc_pmc(df_run_all, ctl_days=42, atl_days=7):
     pmc["TSB"] = (pmc["CTL"] - pmc["ATL"]).round(1)
     return pmc
 
+# ── Decodificador de Google Encoded Polyline (sem dependências externas) ────
+def decode_polyline(encoded):
+    """Decodifica Google Encoded Polyline → lista de (lat, lng)."""
+    if not encoded or pd.isna(encoded) or str(encoded) in ("nan","None",""):
+        return []
+    encoded = str(encoded)
+    coords, idx, lat, lng = [], 0, 0, 0
+    while idx < len(encoded):
+        for is_lng in (False, True):
+            shift = result = 0
+            while True:
+                if idx >= len(encoded): break
+                b = ord(encoded[idx]) - 63
+                idx += 1
+                result |= (b & 0x1f) << shift
+                shift += 5
+                if b < 0x20: break
+            delta = ~(result >> 1) if (result & 1) else (result >> 1)
+            if not is_lng: lat += delta
+            else:          lng += delta
+        coords.append((lat / 1e5, lng / 1e5))
+    return coords
+
+def hex_to_rgba(hex_color, alpha=200):
+    """Converte #RRGGBB → [R, G, B, A] para pydeck."""
+    h = hex_color.lstrip("#")
+    return [int(h[i:i+2], 16) for i in (0, 2, 4)] + [alpha]
+
+def pace_to_rgba(pace_sec, min_pace=220, max_pace=420, alpha=220):
+    """Gradiente verde (rápido) → vermelho (lento) para heatmap."""
+    t = min(1, max(0, (pace_sec - min_pace) / (max_pace - min_pace)))
+    return [round(46 + t*185), round(204 - t*128), round(113 - t*53), alpha]
+
+def compute_main_laps_pace(laps_group):
+    """Pace da fase principal (remove aquec/desaquec — laps >15% mais lentos que mediana)."""
+    if laps_group.empty:
+        return None
+    laps = laps_group.sort_values("lap_index").copy()
+    laps = laps[laps["pace_sec_km"].notna() & (laps["pace_sec_km"] > 0) & (laps["pace_sec_km"] < 500)]
+    if len(laps) == 0:
+        return None
+    if len(laps) <= 2:
+        return float(laps["pace_sec_km"].mean())
+    mediana  = float(laps["pace_sec_km"].median())
+    threshold = mediana * 1.15
+    if len(laps) > 3 and float(laps.iloc[0]["pace_sec_km"]) > threshold:
+        laps = laps.iloc[1:]
+    if len(laps) > 2 and float(laps.iloc[-1]["pace_sec_km"]) > threshold:
+        laps = laps.iloc[:-1]
+    if laps.empty:
+        return None
+    total_dist = float(laps["distance_km"].sum())
+    if total_dist <= 0:
+        return float(laps["pace_sec_km"].mean())
+    return float((laps["pace_sec_km"] * laps["distance_km"]).sum() / total_dist)
+
+def fc_to_hex(fc_bpm):
+    """FC em bpm → cor por zona cardíaca (azul Z1 → vermelho Z5)."""
+    if pd.isna(fc_bpm) or float(fc_bpm) <= 0: return "#3498DB"
+    fc = float(fc_bpm)
+    if fc < 137: return "#3498DB"
+    if fc < 165: return "#2ECC71"
+    if fc < 175: return "#F39C12"
+    if fc < 185: return "#E67E22"
+    return "#E74C3C"
+
+def elev_gain_to_hex(elev_m_per_km):
+    """Elevação m/km → cor: verde (plano) → vermelho (morro, >45m/km)."""
+    if pd.isna(elev_m_per_km) or float(elev_m_per_km) < 0: return "#2ECC71"
+    t = min(1.0, max(0.0, float(elev_m_per_km) / 45.0))
+    return "#{:02X}{:02X}{:02X}".format(
+        round(46 + t*185), round(204 - t*128), round(113 - t*53))
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DADOS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -229,6 +326,9 @@ def load_all(base):
         act["Semana"]     = act["start_date"].dt.to_period("W").apply(lambda x: x.ordinal)
         act["SemanaStr"]  = act["start_date"].dt.strftime("Sem %V/%Y")
         act["DiaSemana"]  = act["start_date"].dt.day_name().map(DIAS_PT)
+        for _c in ["latitude","longitude"]:
+            if _c in act.columns:
+                act[_c] = pd.to_numeric(act[_c], errors="coerce")
         rename_map = {c: "Intensidade" for c in act.columns if c.lower() == "intensidade"}
         act = act.rename(columns=rename_map)
         if "Intensidade" in act.columns:
@@ -274,8 +374,18 @@ pmc_raw = calc_pmc(_runs_raw)
 st.sidebar.title("🎛️ Filtros")
 min_d = df_raw["start_date"].min().date()
 max_d = df_raw["start_date"].max().date()
-date_range = st.sidebar.date_input("Período", value=(min_d, max_d),
-                                    min_value=min_d, max_value=max_d)
+
+_col1, _col2 = st.sidebar.columns([3, 1])
+with _col1:
+    st.markdown("**Período**")
+with _col2:
+    if st.button("↺", help="Resetar para o período completo", key="reset_date"):
+        st.session_state["date_range"] = (min_d, max_d)
+
+date_range = st.sidebar.date_input(
+    "Período", value=st.session_state.get("date_range", (min_d, max_d)),
+    min_value=min_d, max_value=max_d, key="date_range",
+    label_visibility="collapsed")
 sports_all      = sorted(df_raw["sport_type"].dropna().unique())
 _default_sports = [s for s in ["Run","TrailRun"] if s in sports_all]
 if not _default_sports:
@@ -306,7 +416,9 @@ def filt_act(d):
     mask = ((d["start_date"] >= s_dt) & (d["start_date"] <= e_dt)
             & d["sport_type"].isin(selected_sports))
     if sel_int and int_col in d.columns:
-        mask &= d[int_col].isin(sel_int)
+        # Inclui atividades sem intensidade calculada (NaN = sem FC ou sem laps)
+        # Só exclui quando a intensidade É conhecida e NÃO está selecionada
+        mask &= d[int_col].isin(sel_int) | d[int_col].isna()
     return d[mask].copy()
 
 def filt_laps(d):
@@ -352,11 +464,11 @@ def melhor_3km():
 # ══════════════════════════════════════════════════════════════════════════════
 #  ABAS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_geral, tab_perf, tab_fc, tab_intel, tab_elev, tab_clima, tab_metas, tab_vol, tab_coach, tab_hist = st.tabs([
+tab_geral, tab_perf, tab_fc, tab_intel, tab_elev, tab_clima, tab_metas, tab_vol, tab_coach, tab_mapa, tab_hist = st.tabs([
     "📊 Visão Geral","⚡ Performance e Pace","❤️ Frequência Cardíaca",
     "🧠 Inteligência de Treino","⛰️ Elevação","🌤️ Clima",
     "🎯 Metas e Benchmarks","📈 Volume e Evolução","🧑‍🏫 Visão Treinador",
-    "📋 Histórico",
+    "🗺️ Mapa de Rotas","📋 Histórico",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,7 +502,7 @@ with tab_geral:
                      labels={"KM":"km","MesAno":""}, text_auto=".0f")
         fig.update_traces(textposition="outside")
         fig.update_layout(xaxis_tickangle=-45, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_b:
         if "Intensidade" in df.columns and df["Intensidade"].notna().any():
@@ -402,7 +514,7 @@ with tab_geral:
                          color="Intensidade", color_discrete_map=INTENSITY_COLORS,
                          category_orders={"Intensidade": INTENSITY_ORDER})
             fig.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             label = "🤖 Automática (FC)" if int_mode == "Automática (FC)" else "✍️ Manual"
             with st.expander(f"Como cada categoria é definida? — {label}"):
@@ -441,7 +553,7 @@ with tab_geral:
     set_pace_yaxis(fig, df_p["Pace"])
     fig.update_layout(title="⚡ Evolução do Pace Médio + Média Móvel 3M",
                       xaxis_tickangle=-45)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption("📖 Eixo Y invertido: quanto mais alto no gráfico, mais rápido.")
 
     if len(df_p) >= 2:
@@ -461,7 +573,7 @@ with tab_geral:
                  title="📅 Atividades por Dia da Semana",
                  color_discrete_sequence=[PURPLE], text_auto=True)
     fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -497,14 +609,26 @@ with tab_perf:
                 hovertemplate="<b>%{x}</b><br>Melhor pace: %{customdata[0]}/km<extra></extra>")
             set_pace_yaxis(fig, be_best["Pace"])
             fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     col_a, col_b = st.columns(2)
 
     with col_a:
         if "Intensidade" in df_run.columns:
-            df_b = cat_intensity(df_run[df_run["pace_sec_km"].notna()].copy())
-            df_agg = (df_b.groupby("Intensidade", observed=True)["pace_sec_km"]
+            # Usa pace do bloco principal (exclui aquec/desaquec por atividade)
+            if not lps_run.empty:
+                _mp = (lps_run.groupby("activity_id")
+                       .apply(compute_main_laps_pace).dropna().reset_index())
+                _mp.columns = ["id", "pace_main"]
+                df_run_p = df_run.merge(_mp, on="id", how="left")
+                df_run_p["pace_plot"] = df_run_p["pace_main"].fillna(df_run_p["pace_sec_km"])
+                _src = "bloco principal (aquec/desaquec excluídos)"
+            else:
+                df_run_p = df_run.copy()
+                df_run_p["pace_plot"] = df_run_p["pace_sec_km"]
+                _src = "corrida completa"
+            df_b = cat_intensity(df_run_p[df_run_p["pace_plot"].notna()].copy())
+            df_agg = (df_b.groupby("Intensidade", observed=True)["pace_plot"]
                          .agg(Media="mean", DP="std").reset_index().dropna())
             df_agg["Media_min"] = df_agg["Media"] / 60
             df_agg["DP_min"]    = df_agg["DP"] / 60
@@ -520,8 +644,10 @@ with tab_perf:
                 )
             set_pace_yaxis(fig, df_agg["Media"])
             fig.update_layout(title="🎯 Pace Médio por Intensidade", showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Barra = pace médio. Traço vertical = desvio padrão.")
+            st.plotly_chart(fig, width="stretch")
+            st.caption(
+                f"Pace do **{_src}**. Laps de aquecimento/desaquecimento "
+                "(>15% mais lentos que a mediana da sessão) são excluídos.")
 
     with col_b:
         df_s = df_run[df_run["pace_sec_km"].notna() & df_run["distance_km"].notna()].copy()
@@ -535,7 +661,7 @@ with tab_perf:
                          opacity=0.65,
                          labels={"distance_km":"Distância (km)","Pace_min":"Pace (min/km)"})
         set_pace_yaxis(fig, df_s["pace_sec_km"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     df_ef = (df_run[df_run["efficiency_index"].notna()]
              .groupby(["MesAnoOrd","MesAno"])
@@ -547,7 +673,7 @@ with tab_perf:
                       color_discrete_sequence=[GREEN],
                       labels={"Ef":"Eficiência","MesAno":""})
         fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -591,7 +717,7 @@ with tab_fc:
                          labels={"Pct":"% Tempo","Zona FC":""})
             fig.update_traces(textposition="outside")
             fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.caption("📖 Z1 = regenerativo → Z5 = esforço máximo. "
                        "Ideal para base: >70% do tempo em Z1+Z2.")
 
@@ -615,7 +741,7 @@ with tab_fc:
             fig.add_hline(y=10, line_dash="dot",  line_color=AMBER,
                           annotation_text="+10 bpm — atenção")
             fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             if not df_deriv_m.empty:
                 last_drift = df_deriv_m["Deriva"].iloc[-1]
@@ -633,7 +759,7 @@ with tab_fc:
                       color_discrete_sequence=[RED],
                       labels={"FC":"bpm","MesAno":""})
         fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # ── NOVO: Distribuição de Zonas vs Modelo Polarizado ─────────────────
         st.markdown("---")
@@ -694,7 +820,7 @@ with tab_fc:
                 category_orders={"Zona FC": ZONA_ORDER})
             fig_at.update_traces(textinfo="percent+label", textposition="inside")
             fig_at.update_layout(showlegend=False)
-            st.plotly_chart(fig_at, use_container_width=True)
+            st.plotly_chart(fig_at, width="stretch")
 
         with col_p2:
             fig_id = px.pie(
@@ -706,7 +832,7 @@ with tab_fc:
                 category_orders={"Zona FC": ZONA_ORDER})
             fig_id.update_traces(textinfo="percent+label", textposition="inside")
             fig_id.update_layout(showlegend=False)
-            st.plotly_chart(fig_id, use_container_width=True)
+            st.plotly_chart(fig_id, width="stretch")
 
         st.caption(
             "📖 **Modelo polarizado (Seiler):** ~80% em Z1+Z2 (conversa fácil), "
@@ -762,12 +888,6 @@ with tab_intel:
             recent_ids = (lps_run.sort_values("start_date", ascending=False)
                           ["activity_id"].unique()[:10])
             df_box = lps_run[lps_run["activity_id"].isin(recent_ids)].copy()
-            # Remove paces de caminhada/outliers (>8:20/km) antes de agregar
-            df_box = df_box[
-                df_box["pace_sec_km"].notna() &
-                (df_box["pace_sec_km"] > 0) &
-                (df_box["pace_sec_km"] <= 500)
-            ]
             df_box["Data"] = df_box["start_date"].dt.strftime("%d/%m")
             df_agg2 = (df_box.groupby("Data")["pace_sec_km"]
                              .agg(Media="mean", DP="std").reset_index().dropna())
@@ -781,7 +901,7 @@ with tab_intel:
             ))
             set_pace_yaxis(fig, df_agg2["Media"])
             fig.update_layout(title="📅 Pace Médio — 10 Treinos Mais Recentes")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with col_b:
             df_hist = lps_run[lps_run["pace_sec_km"].notna()].copy()
@@ -791,7 +911,7 @@ with tab_intel:
                                color_discrete_sequence=[PURPLE],
                                labels={"Pace_min":"Pace (min/km)"})
             fig.update_yaxes(title="Nº de Laps")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         lps_cv = lps_run.merge(cv_df, on="activity_id")
         df_cv_m = (lps_cv.groupby(["MesAnoOrd","MesAno"])
@@ -806,7 +926,7 @@ with tab_intel:
         fig.add_hline(y=25, line_dash="dash", line_color=RED,
                       annotation_text="> 25% — treino intervalado")
         fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -843,7 +963,7 @@ with tab_elev:
                          labels={"Elev":"metros","MesAno":""}, text_auto=".0f")
             fig.update_traces(textposition="outside")
             fig.update_layout(xaxis_tickangle=-45, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with col_b:
             fig = px.histogram(df_e, x="elevation_gain", nbins=30,
@@ -851,7 +971,7 @@ with tab_elev:
                                color_discrete_sequence=[AMBER],
                                labels={"elevation_gain":"Elevação (m)"})
             fig.update_yaxes(title="Nº de Atividades")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         col_a, col_b = st.columns(2)
 
@@ -868,7 +988,7 @@ with tab_elev:
                              labels={"elevation_gain":"Elevação (m)",
                                      "Pace_min":"Pace (min/km)"})
             set_pace_yaxis(fig, df_pe["pace_sec_km"])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with col_b:
             df_fe = df_e[df_e["average_heartrate"].notna()].copy()
@@ -881,7 +1001,7 @@ with tab_elev:
                              category_orders={"Intensidade": INTENSITY_ORDER},
                              labels={"elevation_gain":"Elevação (m)",
                                      "average_heartrate":"FC Média (bpm)"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         top10 = (df_e.nlargest(10, "elevation_gain")
                      [["start_date","name","distance_km","elevation_gain","elev_km","pace_sec_km"]]
@@ -915,7 +1035,7 @@ with tab_elev:
                              labels={"ElevTotal":"metros","Intensidade":""})
                 fig.update_traces(textposition="outside")
                 fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             with col_b:
                 fig = px.bar(df_ei, x="Intensidade", y="ElevMedia",
                              title="📐 Elevação Média por Atividade e Tipo",
@@ -925,7 +1045,7 @@ with tab_elev:
                              labels={"ElevMedia":"metros","Intensidade":""})
                 fig.update_traces(textposition="outside")
                 fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         df_grad = (df_e.groupby(["MesAnoOrd","MesAno"])
                        .agg(Grad=("elev_km","mean")).reset_index()
@@ -935,7 +1055,7 @@ with tab_elev:
                       color_discrete_sequence=[AMBER],
                       labels={"Grad":"m/km","MesAno":""})
         fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -981,7 +1101,7 @@ with tab_clima:
             fig.update_yaxes(autorange="reversed")
             fig.add_vrect(x0=18, x1=24, fillcolor=GREEN, opacity=0.07,
                           annotation_text="Zona Ideal")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with col_b:
             bins   = [0,15,18,22,26,50]
@@ -999,7 +1119,7 @@ with tab_clima:
             set_pace_yaxis(fig, df_f["Pace"].dropna())
             fig.update_traces(textposition="outside")
             fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         if "weather_rain" in df_w.columns:
             pace_chuva = df_w[df_w["weather_rain"] > 0]["pace_sec_km"].mean()
@@ -1057,7 +1177,7 @@ with tab_metas:
                     hovertemplate="<b>%{x}</b><br>Melhor pace: %{customdata[0]}/km<extra></extra>")
                 set_pace_yaxis(fig, be_ev_m["Pace"])
                 fig.update_layout(xaxis_tickangle=-45)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         with col_b:
             pr_df = be[be["pr_rank"].notna()]
@@ -1068,7 +1188,7 @@ with tab_metas:
                              title="🏅 PRs Conquistados por Distância",
                              color_discrete_sequence=[AMBER], text_auto=True)
                 fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
     df_meta = (df_run.groupby(["MesAnoOrd","MesAno"])
                      .agg(KM=("distance_km","sum"), Treinos=("id","count"))
@@ -1087,7 +1207,7 @@ with tab_metas:
     fig.add_hline(y=100, line_dash="dash", line_color=AMBER, annotation_text="Meta 100%")
     fig.update_layout(barmode="group", title="📊 % Metas Mensais — últimos 12 meses",
                       yaxis_title="%", xaxis_tickangle=-45)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1105,7 +1225,7 @@ with tab_vol:
                       title="📏 Distância Acumulada",
                       color_discrete_sequence=[BLUE],
                       labels={"start_date":"","KM_Acum":"km"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_b:
         df_sem = (df_run.groupby(["Semana","SemanaStr"])
@@ -1116,7 +1236,7 @@ with tab_vol:
                      color_discrete_sequence=[PURPLE], text_auto=".0f",
                      labels={"SemanaStr":"","KM":"km"})
         fig.update_layout(xaxis_tickangle=-45, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     if "Intensidade" in df_run.columns:
         df_int_m = cat_intensity(
@@ -1129,7 +1249,7 @@ with tab_vol:
                      category_orders={"Intensidade": INTENSITY_ORDER},
                      labels={"KM":"km","MesAno":"","Intensidade":"Intensidade"})
         fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     df_mom = (df_run.groupby(["MesAnoOrd","MesAno"])
                     .agg(KM=("distance_km","sum")).reset_index()
@@ -1149,7 +1269,7 @@ with tab_vol:
     fig.add_hline(y=-10, line_color=AMBER, line_dash="dot")
     fig.update_layout(title="📊 Crescimento de Volume MoM (%)",
                       yaxis_title="%", xaxis_tickangle=-45)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1215,7 +1335,7 @@ with tab_coach:
                           annotation_text="Zona Segura (0.8–1.3)")
             fig.add_hline(y=1.5, line_dash="dash", line_color=RED,
                           annotation_text="Risco Alto (1.5)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     with col_b:
         if df_run["suffer_score"].notna().any():
@@ -1236,7 +1356,7 @@ with tab_coach:
             fig.add_hline(y=-10, line_dash="dash", line_color=AMBER)
             fig.update_layout(title="📊 Variação de Carga Semanal (%)",
                               xaxis_tickangle=-45, yaxis_title="%")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     df_fc8 = (df_run[df_run["average_heartrate"].notna()]
               .groupby(["Semana","SemanaStr"])
@@ -1254,7 +1374,7 @@ with tab_coach:
                       color_discrete_sequence=[RED],
                       labels={"FC":"bpm","SemanaStr":""})
         fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ── NOVO: PMC — CTL / ATL / TSB ──────────────────────────────────────────
     if not pmc_raw.empty:
@@ -1317,7 +1437,7 @@ with tab_coach:
                 legend=dict(orientation="h", y=-0.18),
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_pmc, use_container_width=True)
+            st.plotly_chart(fig_pmc, width="stretch")
 
             if   tsb_at > 20:   st.info("😴 TSB alto — atleta descansado. Boa janela para treino de qualidade ou competição.")
             elif tsb_at >= 5:   st.success("✅ TSB na janela ideal (+5 a +20). Forma em dia.")
@@ -1356,7 +1476,7 @@ with tab_coach:
             yaxis_title="% do tempo",
             legend=dict(orientation="h", y=-0.15),
         )
-        st.plotly_chart(fig_pol, use_container_width=True)
+        st.plotly_chart(fig_pol, width="stretch")
         st.caption(
             "📖 Linha tracejada = modelo polarizado ideal (Seiler). "
             "Barras acima da linha = excesso nessa zona. O maior problema típico é excesso em Z3 e déficit em Z1."
@@ -1418,7 +1538,7 @@ with tab_coach:
                     xaxis_tickangle=-45,
                     showlegend=False,
                 )
-                st.plotly_chart(fig_ae, use_container_width=True)
+                st.plotly_chart(fig_ae, width="stretch")
 
                 if delta_ae >= 15:
                     st.success(
@@ -1440,6 +1560,369 @@ with tab_coach:
 # ══════════════════════════════════════════════════════════════════════════════
 #  10 · HISTÓRICO
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  10 · MAPA DE ROTAS — Folium animado + Comparativo de pace
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_mapa:
+    st.title("\U0001f5fa️ Mapa de Rotas")
+
+    _POLY_CANDIDATES = ["map_polyline","polyline","map.polyline",
+                        "summary_polyline","map_summary_polyline"]
+    poly_col = next((c for c in _POLY_CANDIDATES
+                     if c in df_raw.columns and df_raw[c].notna().any()), None)
+    has_ll   = "latitude" in df_run.columns and "longitude" in df_run.columns
+
+    # ── Cards de analise ────────────────────────────────────────────────────
+
+    if not has_ll and poly_col is None:
+        st.error("Nenhum dado de GPS encontrado.")
+        st.stop()
+
+    if poly_col is None:
+        _msg = ("**Mostrando pontos de inicio** (colunas `latitude`/`longitude`). "
+                "Para rotas completas, adicione ao extrator:\n\n"
+                "```python\n'map_summary_polyline': activity.get('map', {}).get('summary_polyline', ''),\n```")
+        st.info(_msg)
+
+    # ── Preparacao dos dados ────────────────────────────────────────────────
+    df_map = df_run.copy()
+    if has_ll:
+        df_map = df_map[df_map["latitude"].notna() & df_map["longitude"].notna()]
+    if poly_col:
+        df_map = df_map[df_map[poly_col].notna() & (df_map[poly_col].astype(str).str.len() > 4)]
+    df_map = df_map.sort_values("start_date", ascending=False)
+
+    if df_map.empty:
+        st.warning("Nenhuma atividade com dados de GPS no periodo selecionado.")
+    else:
+        # ── Seletor individual de atividades ──────────────────────────────────
+        def _make_label(row):
+            dt  = row["start_date"].strftime("%d/%m/%Y")
+            nm  = str(row.get("name") or "")[:35]
+            km  = round(float(row.get("distance_km") or 0), 1)
+            int_v = str(row.get("Intensidade") or "")
+            int_tag = f" [{int_v}]" if int_v and int_v != "None" else ""
+            return f"{dt} — {nm} ({km}km){int_tag}"
+
+        _label_to_id = {_make_label(row): row["id"] for _, row in df_map.iterrows()}
+        _all_labels  = list(_label_to_id.keys())
+
+        sel_labels = st.multiselect(
+            "Selecione atividades para exibir e comparar",
+            options=_all_labels,
+            default=_all_labels[:min(10, len(_all_labels))],
+            help="Digite para buscar por nome, data ou distância. Selecione várias para comparar no mapa e no gráfico de pace.",
+            placeholder="Busque por nome, data ou distância...",
+        )
+
+        if not sel_labels:
+            st.info("Selecione ao menos uma atividade acima para ver o mapa.")
+            st.stop()
+
+        _sel_ids = [_label_to_id[l] for l in sel_labels]
+        df_map   = df_map[df_map["id"].isin(_sel_ids)].copy()
+        st.caption(f"**{len(df_map)}** atividade(s) selecionada(s) · {len(_all_labels)} disponíveis no período")
+
+        lat_c = float(df_map["latitude"].mean()) if has_ll else -23.55
+        lng_c = float(df_map["longitude"].mean()) if has_ll else -46.63
+
+        def get_color_hex(row):
+            int_val = str(row.get("Intensidade","Moderado") or "Moderado")
+            return INTENSITY_COLORS.get(int_val, BLUE)
+
+        def pace_to_hex(pace_sec):
+            t = min(1, max(0, (float(pace_sec or 300) - 220) / 200))
+            return "#{:02X}{:02X}{:02X}".format(
+                round(46+t*185), round(204-t*128), round(113-t*53))
+
+        # Monta lista de rotas
+        routes = []
+        for _, row in df_map.iterrows():
+            coords = decode_polyline(row[poly_col]) if poly_col else []
+            r_km   = float(row.get("distance_km") or 0)
+            hr_v   = int(row["average_heartrate"]) if not pd.isna(row.get("average_heartrate", float("nan"))) else 0
+            routes.append({
+                "id":       row.get("id"),
+                "name":     str(row.get("name","") or ""),
+                "date":     row["start_date"].strftime("%d/%m/%Y"),
+                "km":       round(r_km, 1),
+                "pace":     fmt_pace(row.get("pace_sec_km", 0) or 0),
+                "pace_sec": float(row.get("pace_sec_km") or 300),
+                "hr":       hr_v,
+                "intensity":str(row.get("Intensidade","Moderado") or "Moderado"),
+                "color_hex":get_color_hex(row),
+                "lat":      float(row["latitude"]) if has_ll and not pd.isna(row.get("latitude", float("nan"))) else lat_c,
+                "lng":      float(row["longitude"]) if has_ll and not pd.isna(row.get("longitude", float("nan"))) else lng_c,
+                "coords":   coords,
+            })
+
+        # ── SECAO 1: Mapa Folium (fragment isola do re-render externo) ───────────
+        st.subheader("🗺️ Mapa — rotas animadas")
+
+        if not HAS_FOLIUM:
+            st.error("Instale: `pip install streamlit-folium folium`")
+        else:
+            _routes_snap = routes
+            _lps_snap    = lps_run
+            _poly_snap   = poly_col
+            _lat2, _lng2 = lat_c, lng_c
+
+            try:
+                _frag = st.fragment
+            except AttributeError:
+                def _frag(f): return f
+
+            @_frag
+            def _render_folium():
+                _MODES = [
+                    "Intensidade",
+                    "Pace (rapido/lento)",
+                    "FC por zona",
+                    "Elevacao por segmento",
+                ]
+                mode_map = st.radio("Colorir rotas por", _MODES, horizontal=True)
+                tile_map = st.radio("Mapa base", ["Claro","Escuro","Topografico"],
+                                    horizontal=True)
+                tile_urls = {
+                    "Claro":       "CartoDB positron",
+                    "Escuro":      "CartoDB dark_matter",
+                    "Topografico": "OpenTopoMap",
+                }
+                m = folium.Map(location=[_lat2, _lng2], zoom_start=13, tiles=None)
+                folium.TileLayer(tile_urls[tile_map], name=tile_map).add_to(m)
+
+                try:
+                    from folium.plugins import AntPath, MiniMap
+                    MiniMap(toggle_display=True, position="bottomleft",
+                            tile_layer="CartoDB positron",
+                            zoom_level_offset=-5).add_to(m)
+                    _ant = True
+                except Exception:
+                    _ant = False
+
+                def _seg_color(lap, r, mode):
+                    if mode == "Pace (rapido/lento)":
+                        return pace_to_hex(lap.get("pace_sec_km", r["pace_sec"]))
+                    if mode == "FC por zona":
+                        return fc_to_hex(lap.get("average_heartrate", r["hr"]))
+                    if mode == "Elevacao por segmento":
+                        d = float(lap.get("distance_km") or 1)
+                        e = float(lap.get("total_elevation_gain") or 0)
+                        return elev_gain_to_hex(e / d if d > 0 else 0)
+                    return r["color_hex"]
+
+                def _popup(r):
+                    n = r["name"][:30]
+                    dt = r["date"]
+                    km = r["km"]
+                    pc = r["pace"]
+                    hr = r["hr"] or "—"
+                    ci = r["color_hex"]
+                    it = r["intensity"]
+                    return (
+                        "<div style='font-family:sans-serif;min-width:190px;padding:2px'>"
+                        "<b style='font-size:13px'>" + n + "</b><br>"
+                        "<span style='color:#888;font-size:11px'>" + dt + "</span>"
+                        "<table style='font-size:12px;width:100%;margin-top:6px'>"
+                        "<tr><td style='color:#888;padding:2px 10px 2px 0'>Dist</td>"
+                        "<td><b>" + str(km) + " km</b></td></tr>"
+                        "<tr><td style='color:#888;padding:2px 10px 2px 0'>Pace</td>"
+                        "<td><b>" + pc + "/km</b></td></tr>"
+                        "<tr><td style='color:#888;padding:2px 10px 2px 0'>FC</td>"
+                        "<td><b>" + str(hr) + " bpm</b></td></tr>"
+                        "</table>"
+                        "<div style='margin-top:7px;padding:3px 8px;border-radius:4px;"
+                        "background:" + ci + "20;border-left:3px solid " + ci + ";"
+                        "font-size:11px;color:#444'>" + it + "</div></div>"
+                    )
+
+                for r in _routes_snap:
+                    _fg_name = r["date"] + " — " + r["name"][:20] + " (" + str(r["km"]) + "km)"
+                    fg = folium.FeatureGroup(name=_fg_name, show=True)
+                    pop = folium.Popup(_popup(r), max_width=220)
+
+                    if _poly_snap and r["coords"]:
+                        act_laps = (
+                            _lps_snap[_lps_snap["activity_id"] == r["id"]]
+                            .sort_values("lap_index")
+                            if not _lps_snap.empty else pd.DataFrame())
+
+                        if mode_map == "Intensidade":
+                            if _ant:
+                                AntPath(r["coords"], color=r["color_hex"], weight=4.5,
+                                        dash_array=[12, 20], delay=800, opacity=0.92,
+                                        popup=pop).add_to(fg)
+                            else:
+                                folium.PolyLine(r["coords"], color=r["color_hex"],
+                                               weight=4.5, opacity=0.9,
+                                               popup=pop).add_to(fg)
+                        else:
+                            coords_all = r["coords"]
+                            n_pts = len(coords_all) - 1
+                            if not act_laps.empty and n_pts > 0:
+                                total_km = act_laps["distance_km"].sum()
+                                cum = 0.0
+                                for _, lap in act_laps.iterrows():
+                                    frac = (float(lap["distance_km"]) / total_km
+                                            if total_km > 0 else 1 / len(act_laps))
+                                    i0 = int(cum * n_pts)
+                                    i1 = min(n_pts, int((cum + frac) * n_pts) + 1)
+                                    seg = coords_all[i0:i1 + 1]
+                                    if len(seg) >= 2:
+                                        cseg = _seg_color(lap, r, mode_map)
+                                        if _ant:
+                                            AntPath(seg, color=cseg, weight=5,
+                                                    dash_array=[12, 20], delay=800,
+                                                    opacity=0.9).add_to(fg)
+                                        else:
+                                            folium.PolyLine(seg, color=cseg,
+                                                           weight=5, opacity=0.9).add_to(fg)
+                                    cum += frac
+                            else:
+                                cseg = _seg_color({}, r, mode_map)
+                                if _ant:
+                                    AntPath(coords_all, color=cseg, weight=5,
+                                            dash_array=[12, 20], delay=800,
+                                            opacity=0.9).add_to(fg)
+                                else:
+                                    folium.PolyLine(coords_all, color=cseg,
+                                                   weight=5, opacity=0.9).add_to(fg)
+
+                        folium.CircleMarker(
+                            r["coords"][0], radius=6, color=r["color_hex"],
+                            fill=True, fill_opacity=1, weight=2,
+                            tooltip="Início").add_to(fg)
+                    else:
+                        folium.CircleMarker(
+                            [r["lat"], r["lng"]],
+                            radius=max(5, min(16, r["km"] * 0.9)),
+                            color=r["color_hex"], fill=True, fill_opacity=0.8,
+                            popup=pop).add_to(fg)
+
+                    fg.add_to(m)
+
+                folium.LayerControl(collapsed=True, position="topright").add_to(m)
+
+                # Legenda transparente — construida sem backslash em f-string
+                _li_int = "".join(
+                    "<div style='display:flex;align-items:center;gap:6px;margin:3px 0;"
+                    "color:rgba(255,255,255,.85)'>"
+                    "<div style='width:16px;height:4px;background:" + c + ";"
+                    "border-radius:2px;flex-shrink:0'></div>" + k + "</div>"
+                    for k, c in INTENSITY_COLORS.items() if k != "Skate"
+                )
+                _li_pace = (
+                    "<div style='display:flex;align-items:center;gap:5px;"
+                    "color:rgba(255,255,255,.8)'><span>lento</span>"
+                    "<div style='width:50px;height:5px;border-radius:3px;"
+                    "background:linear-gradient(to right,rgb(231,76,60),rgb(46,204,113))'>"
+                    "</div><span>rápido</span></div>"
+                )
+                _li_fc = "".join(
+                    "<div style='display:flex;align-items:center;gap:6px;margin:3px 0;"
+                    "color:rgba(255,255,255,.85)'>"
+                    "<div style='width:16px;height:4px;background:" + c + ";"
+                    "border-radius:2px'></div>" + z + "</div>"
+                    for z, c in [("Z1 <137bpm","#3498DB"),("Z2 <165","#2ECC71"),
+                                  ("Z3 <175","#F39C12"),("Z4 <185","#E67E22"),
+                                  ("Z5 ≥185","#E74C3C")]
+                )
+                _li_elev = (
+                    "<div style='display:flex;align-items:center;gap:5px;"
+                    "color:rgba(255,255,255,.8)'><span>plano</span>"
+                    "<div style='width:50px;height:5px;border-radius:3px;"
+                    "background:linear-gradient(to right,rgb(46,204,113),rgb(231,76,60))'>"
+                    "</div><span>morro</span></div>"
+                )
+                _LEG = {
+                    "Intensidade":           ("Intensidade",          _li_int),
+                    "Pace (rapido/lento)":   ("Pace",                 _li_pace),
+                    "FC por zona":           ("FC",                   _li_fc),
+                    "Elevacao por segmento": ("Elevação",       _li_elev),
+                }
+                leg_title, leg_items = _LEG.get(mode_map, ("", ""))
+                legend_html = (
+                    "<div style='position:absolute;bottom:36px;left:8px;z-index:9999;"
+                    "background:rgba(10,10,10,0.72);padding:9px 13px;border-radius:10px;"
+                    "font-size:12px;color:rgba(255,255,255,.9)'>"
+                    "<div style='font-weight:600;margin-bottom:5px'>" + leg_title + "</div>"
+                    + leg_items + "</div>"
+                )
+                m.get_root().html.add_child(folium.Element(legend_html))
+
+                st_folium(m, use_container_width=True, height=500, returned_objects=[])
+                _hint = "Clique numa rota para detalhes" if _poly_snap else "Tamanho = distância"
+                st.caption(
+                    _hint + " · Ative/desative rotas no controle (canto superior direito) · "
+                    + ("Animação AntPath ativa" if _ant else "pip install folium para animação")
+                )
+
+            _render_folium()
+
+        # ── SECAO 2: Comparativo de pace por lap ─────────────────────────────
+        st.markdown("---")
+        st.subheader("\U0001f3c3 Comparativo de pace por lap")
+        st.caption("Substituicao do 3D — mais util: ve a evolucao do ritmo km a km dentro de cada corrida.")
+
+        if lps_run.empty:
+            st.info("Dados de laps nao disponíveis para analise de pace por segmento.")
+        else:
+            run_opts = {f"{r['date']} — {r['name'][:22]} ({r['km']}km)": r for r in routes}
+            sel_runs = st.multiselect(
+                "Selecione corridas para comparar (ate 5)",
+                list(run_opts.keys()),
+                default=list(run_opts.keys())[:min(3, len(run_opts))],
+                max_selections=5,
+            )
+
+            fig_cmp = go.Figure()
+            all_paces_cmp = []
+
+            for label in sel_runs:
+                r = run_opts[label]
+                laps_r = (lps_run[lps_run["activity_id"] == r["id"]]
+                          .sort_values("lap_index").copy())
+                laps_r = laps_r[laps_r["pace_sec_km"].notna()
+                                & (laps_r["pace_sec_km"] > 0)
+                                & (laps_r["pace_sec_km"] < 600)]
+                if laps_r.empty:
+                    continue
+
+                all_paces_cmp.extend(laps_r["pace_sec_km"].tolist())
+                laps_r["pace_min"] = laps_r["pace_sec_km"] / 60
+                laps_r["pace_fmt"] = laps_r["pace_sec_km"].apply(fmt_pace)
+
+                fig_cmp.add_trace(go.Scatter(
+                    x=laps_r["lap_index"],
+                    y=laps_r["pace_min"],
+                    name=label[:38],
+                    mode="lines+markers",
+                    line=dict(color=r["color_hex"], width=2.5),
+                    marker=dict(size=6, color=r["color_hex"]),
+                    customdata=laps_r["pace_fmt"],
+                    hovertemplate="Km %{x}<br>Pace: %{customdata}/km<extra></extra>",
+                ))
+
+            if fig_cmp.data and all_paces_cmp:
+                pace_series = pd.Series([p for p in all_paces_cmp if 0 < p < 600])
+                set_pace_yaxis(fig_cmp, pace_series)
+                fig_cmp.update_layout(
+                    title="Pace por lap — evolucao durante a corrida",
+                    xaxis_title="Lap (km)",
+                    legend=dict(orientation="h", y=-0.18, font=dict(size=11)),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_cmp, width="stretch")
+                st.caption(
+                    "Eixo Y invertido — mais alto = mais rapido. "
+                    "Linha descendente = corrida progressiva (comeca lento, termina rapido). "
+                    "Linha plana = ritmo uniforme. Picos = segmentos de recuperacao ou subidas."
+                )
+            elif sel_runs:
+                st.info("Dados de laps nao encontrados para as corridas selecionadas. "
+                        "Verifique se `activity_laps_consolidated.csv` esta atualizado.")
+
 with tab_hist:
     st.title("📋 Histórico de Corridas")
 
@@ -1483,7 +1966,7 @@ with tab_hist:
             "<extra></extra>"))
         set_pace_yaxis(fig, df_sc["pace_sec_km"])
         fig.update_layout(xaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.markdown("---")
 
@@ -1510,7 +1993,7 @@ with tab_hist:
         df_tab["calories"]          = df_tab["calories"].apply(
             lambda x: f"{int(x)}" if not pd.isna(x) else "—")
         df_tab = df_tab.rename(columns=cols)
-        st.dataframe(df_tab, hide_index=True, use_container_width=True)
+        st.dataframe(df_tab, hide_index=True, width="stretch")
 
         st.markdown("---")
         st.subheader("🔎 Detalhes por Lap")
@@ -1584,7 +2067,7 @@ with tab_hist:
                         if n_ignorados > 0:
                             titulo += f" ({n_ignorados} micro-laps ocultados)"
                         fig.update_layout(title=titulo, xaxis_title="Lap")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                 with col_b:
                     laps_fc = laps_ativ[laps_ativ["average_heartrate"].notna()].copy()
@@ -1611,7 +2094,7 @@ with tab_hist:
                             )
                         fig.update_layout(title="❤️ FC por Lap",
                                           xaxis_title="Lap", yaxis_title="bpm")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                     else:
                         st.info("FC não disponível para esta atividade.")
 
@@ -1640,4 +2123,4 @@ with tab_hist:
                 df_laps_tab["average_cadence"] = df_laps_tab["average_cadence"].apply(
                     lambda x: f"{x*2:.0f} spm" if not pd.isna(x) else "—")
                 df_laps_tab = df_laps_tab.rename(columns=cols_lap)
-                st.dataframe(df_laps_tab, hide_index=True, use_container_width=True)
+                st.dataframe(df_laps_tab, hide_index=True, width="stretch")

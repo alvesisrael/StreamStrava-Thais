@@ -1,0 +1,4 @@
+﻿id;name;sport_type;start_date;distance_km;moving_time_sec;elapsed_time_sec;elevation_gain;average_heartrate;max_heartrate;average_cadence;average_speed;max_speed;pace_sec_km;pace_formatted;efficiency_index;calories;suffer_score;pr_count;achievement_count;latitude;longitude;weather_temp;weather_feels_like;weather_humidity;weather_precipitation;weather_rain;weather_wind_speed;weather_wind_gusts;weather_code;weather_condition
+18331237539;Leve;Run;01/05/2026 07:33:46;8.01;2815;2815;22.3;190.4;216.0;83.0;2.844;3.68;351;5:51;1.8456;498.0;203.0;0;0;-28.45485;-49.030238;16.5;17.9;93;0.0;0.0;3.6;7.2;3;Nublado
+18347746974;HIIT;Workout;02/05/2026 11:15:12;2.93;2211;2211;0.0;144.7;183.0;62.2;1.325;4.02;755;12:34;5.2149;243.0;35.0;0;0;;;;;;;;;;;
+18358963969;Corrida matinal;Run;03/05/2026 07:33:11;14.01;5625;6253;430.4;168.4;197.0;80.4;2.491;3.86;402;6:41;2.3842;773.0;238.0;2;3;-28.454877;-49.030557;16.9;14.7;69;0.0;0.0;17.1;35.3;2;Parcialmente nublado
